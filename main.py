@@ -44,7 +44,7 @@ dp = Dispatcher()
 r = Router()
 dp.include_router(r)
 
-DATA_DIR = Path(".")
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 PARTICIPANTS_CSV = DATA_DIR / "participants.csv"
 SETTINGS_CSV = DATA_DIR / "settings.csv"
 
