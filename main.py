@@ -3,6 +3,7 @@ import asyncio
 import logging
 import random
 import csv
+import secrets
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -27,10 +28,22 @@ from apscheduler.triggers.date import DateTrigger
 
 # -------------------- базовая настройка --------------------
 load_dotenv()
+
+# ADMIN_ID может быть нечисловым — аккуратно парсим
+_ADMIN_ID_RAW = os.getenv("ADMIN_ID", "0")
+try:
+    ADMIN_ID = int(_ADMIN_ID_RAW)
+except ValueError:
+    logging.warning("ADMIN_ID в .env не является числом. Использую 0 (без админа).")
+    ADMIN_ID = 0
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 TZ = os.getenv("TZ", "Europe/Moscow")
-TZINFO = ZoneInfo(TZ)
+try:
+    TZINFO = ZoneInfo(TZ)
+except Exception:
+    logging.warning("Некорректный TZ в .env. Использую Europe/Moscow")
+    TZINFO = ZoneInfo("Europe/Moscow")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN в .env")
@@ -44,7 +57,7 @@ dp = Dispatcher()
 r = Router()
 dp.include_router(r)
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+DATA_DIR = Path(".")
 PARTICIPANTS_CSV = DATA_DIR / "participants.csv"
 SETTINGS_CSV = DATA_DIR / "settings.csv"
 
@@ -52,24 +65,46 @@ scheduler = AsyncIOScheduler(timezone=TZINFO)
 file_lock = asyncio.Lock()  # защищаем одновременную запись из одного процесса
 
 # -------------------- CSV-хранилище --------------------
-PART_FIELDS = ["user_id", "full_name", "postal_code", "address", "created_at"]
+PART_FIELDS = ["user_id", "full_name", "postal_code", "address", "wishes", "created_at"]
 SET_FIELDS = ["key", "value"]
 
 PAIRS_CSV = DATA_DIR / "pairs.csv"
-PAIR_FIELDS = ["round_id", "giver_id", "giver_name", "receiver_id", "receiver_name", "confirmed", "confirmed_at"]
+PAIR_FIELDS = [
+    "round_id",
+    "giver_id",
+    "giver_name",
+    "receiver_id",
+    "receiver_name",
+    "confirmed",
+    "confirmed_at",
+]
 
 
 def _ensure_files_sync():
     if not PARTICIPANTS_CSV.exists():
         with PARTICIPANTS_CSV.open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=PART_FIELDS).writeheader()
+    else:
+        # миграция: если в хедере нет wishes — перечитаем и перезапишем с новой схемой
+        with PARTICIPANTS_CSV.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            needs_migration = "wishes" not in (reader.fieldnames or [])
+            rows = list(reader) if needs_migration else None
+        if needs_migration:
+            for r in rows:
+                r.setdefault("wishes", "")
+            with PARTICIPANTS_CSV.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=PART_FIELDS)
+                writer.writeheader()
+                writer.writerows(rows)
+
     if not SETTINGS_CSV.exists():
         with SETTINGS_CSV.open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=SET_FIELDS).writeheader()
+
     if not PAIRS_CSV.exists():
         with PAIRS_CSV.open("w", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=["round_id", "giver_id", "giver_name", "receiver_id",
-                                          "receiver_name"]).writeheader()
+            csv.DictWriter(f, fieldnames=PAIR_FIELDS).writeheader()
 
 
 async def ensure_files():
@@ -83,7 +118,11 @@ def _read_all_participants_sync():
     with PARTICIPANTS_CSV.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            row["user_id"] = int(row["user_id"])
+            if not row.get("user_id"):
+                continue
+            row["user_id"] = int(row["user_id"])  # type: ignore[assignment]
+            # важное: дефолт, если старый файл без колонки wishes
+            row.setdefault("wishes", "")
             rows.append(row)
     return rows
 
@@ -102,6 +141,7 @@ def _write_all_participants_sync(rows):
                 "full_name": r["full_name"],
                 "postal_code": r["postal_code"],
                 "address": r["address"],
+                "wishes": r.get("wishes", ""),  # <-- записываем wishes
                 "created_at": r["created_at"],
             })
 
@@ -118,7 +158,7 @@ async def find_participant(user_id: int):
     return None
 
 
-async def add_participant(user_id: int, full_name: str, postal_code: str, address: str, created_at: str):
+async def add_participant(user_id: int, full_name: str, postal_code: str, address: str, wishes: str, created_at: str):
     async with file_lock:
         rows = await read_all_participants()
         if any(r["user_id"] == user_id for r in rows):
@@ -128,6 +168,7 @@ async def add_participant(user_id: int, full_name: str, postal_code: str, addres
             "full_name": full_name,
             "postal_code": postal_code,
             "address": address,
+            "wishes": wishes,  # <-- записываем пожелание
             "created_at": created_at,
         })
         await write_all_participants(rows)
@@ -189,6 +230,7 @@ class Form(StatesGroup):
     full_name = State()
     postal_code = State()
     address = State()
+    wishes = State()
 
 
 main_kb = ReplyKeyboardMarkup(
@@ -196,6 +238,17 @@ main_kb = ReplyKeyboardMarkup(
         [KeyboardButton(text="Хочешь поучаствовать? Урааа 😳💞")],
         [KeyboardButton(text="Мой статус"), KeyboardButton(text="Удалить мои данные")],
         [KeyboardButton(text="Помощь")],
+    ],
+    resize_keyboard=True
+)
+
+admin_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Хочешь поучаствовать? Урааа 😳💞")],
+        [KeyboardButton(text="Мой статус"), KeyboardButton(text="Удалить мои данные")],
+        [KeyboardButton(text="Помощь")],
+        [KeyboardButton(text="⚙️ Админ: выбрать дату/время")],
+        [KeyboardButton(text="⚙️ Админ: жеребьёвка сейчас"), KeyboardButton(text="⚙️ Админ: сколько участников")],
     ],
     resize_keyboard=True
 )
@@ -209,15 +262,13 @@ def is_admin(m: Message) -> bool:
 # -------------------- обработчики пользователя --------------------
 @r.message(CommandStart())
 async def cmd_start(m: Message):
-    draw_at = await get_setting("draw_at")
     text = (
-        "Привееет 💌✨\n\n"
-        "Это пикми-почта — ну такая скромная, но очень милая штучка, где люди отправляют друг другу добрые письма. "
-        "Жмякни «Заполнить анкету» и расскажи о себе чуточку — совсем-совсем немного: ФИО, индекс и адрес.\n\n"
+        "Привееет 💌✨\n"
+        "Это пикми-почта «на старой дискотеке»— ну такая скромная, но очень милая штучка, где люди отправляют друг другу добрые письма. Жмякни «Заполнить анкету» и расскажи о себе чуточку — совсем-совсем немного: ФИО, индекс и адрес.\n"
         "Когда придёт время, я так тихонечко выберу, кому ты отправишь послание, и пришлю тебе адрес этого человечка... ну если тебе не сложно 📮💖"
-        f"Текущая дата жеребьёвки: <b>{draw_at or 'не назначена'}</b> ({TZ})."
     )
-    await m.answer(text, reply_markup=main_kb)
+    kb = admin_kb if is_admin(m) else main_kb
+    await m.answer(text, reply_markup=kb)
 
 
 @r.message(F.text == "Помощь")
@@ -231,11 +282,6 @@ async def cmd_help(m: Message):
         '• «Хочешь поучаствовать? Урааа 😳💞» — вписать себя в пикми-почту \n'
         '• «Мой статус» — посмотреть, что я храняю о тебе (аккуратно и с любовью) \n'
         '• «Удалить мои данные» — ну… если ты вдруг захотел(а) уйти. Я переживу 😿\n\n'
-
-        "Админ-команды:\n"
-        "• /set_draw — выбрать дату, когда начнётся обменчик\n"
-        "• /draw_now — запустить всё прямо сейчас (как будто я не готовилась, ну ладно 🥺)\n"
-        "• /count — узнать, сколько нас тут таких мягеньких 💞"
     )
 
 
@@ -272,7 +318,7 @@ async def form_postal(m: Message, state: FSMContext):
         return
     await state.update_data(postal_code=code)
     await state.set_state(Form.address)
-    await m.answer("И остался самый-самый финальный штришок — напиши полный адрес! "
+    await m.answer("Напиши, пожалуйста полный адрес! "
                    "\nУлица, дом, квартира, город… ну всё как у больших почт 🏡📬"
                    "\n(я правда очень постараюсь ничего не перепутать 😳)")
 
@@ -285,19 +331,37 @@ async def form_address(m: Message, state: FSMContext):
                        "Можно чуть-чуть подробнее? Я же хочу, чтобы письмо точно дошло 💌")
         return
 
+    await state.update_data(address=addr)
+    await state.set_state(Form.wishes)
+    await m.answer("Расскажи, какое письмо ты бы хотел(а) получить💕\n"
+                   "Может быть, ты сейчас переживаешь что-то сложное и хочешь поддержки, а может ты просто хочешь что-то милое или смешное🥺\n"
+                   "Это поможет отправителю при написании письма!")
+
+
+@r.message(Form.wishes)
+async def form_wishes(m: Message, state: FSMContext):
+    wishes = m.text.strip()
+    if len(wishes) < 10:
+        await m.answer("Ой, пожелание такое маленькое… как будто ты ничего не хочешь мне рассказывать 😿\n"
+                       "Можно чуть-чуть подробнее? Я же хочу, чтобы тебе точно понравилось письмо 💌")
+        return
+
     data = await state.get_data()
     ok = await add_participant(
         user_id=m.from_user.id,
         full_name=data["full_name"],
         postal_code=data["postal_code"],
-        address=addr,
+        address=data["address"],
+        wishes=wishes,
         created_at=datetime.now(TZINFO).isoformat(),
     )
     await state.clear()
     if ok:
         await m.answer("Ого, ты заполнил(а) всё так аккуратно 😳💘 \n"
-                       "Ты в списке пикми-почты! "
-                       "\nМожешь нажать «Мой статус», чтобы посмотреть, как всё миленько сохранилось ✨")
+                       "Ты в списке пикми-почты! \n"
+                       "Можешь нажать «Мой статус», чтобы посмотреть, как всё миленько сохранилось ✨\n\n"
+                       "А пока можешь сделать <a href=\"https://band.link/SZc69\">пресейв</a> чудесной песни мальчиков из «на старой дискотеке». \n"
+                       "14 ноября в день выхода «Хочешь я подарю комету» я выберу самого милого человечка для тебя, и ты сможешь отправить свое письмо 🥰")
     else:
         await m.answer("Ооо, ты уже был(а) здесь… \n"
                        "Ну я не обижаюсь 😳\n"
@@ -316,8 +380,8 @@ async def my_status(m: Message):
         f"ФИО: {row['full_name']}\n"
         f"Индекс: {row['postal_code']}\n"
         f"Адрес: {row['address']}\n"
-        f"Когда: {row['created_at']}\n"
-        f"Всё такое официальное, даже страшно… а вдруг ты подумаешь, что я слишком старалась 🥺"
+        f"Пожелание: {row.get('wishes', '—')}\n"
+        "Всё такое официальное, даже страшно… а вдруг ты подумаешь, что я слишком старалась 🥺"
     )
 
 
@@ -329,11 +393,51 @@ async def delete_me(m: Message):
                    "Если вдруг передумаешь — я буду здесь и тихонечко ждать 💌")
 
 
+@r.message(F.text == "⚙️ Админ: выбрать дату/время")
+async def admin_pick_datetime(m: Message, state: FSMContext):
+    if not is_admin(m):
+        return
+    now = datetime.now(TZINFO)
+    await state.clear()
+    await m.answer("Выбери дату жеребьёвки:", reply_markup=_build_calendar_kb(now.year, now.month))
+
+
+@r.message(F.text == "⚙️ Админ: жеребьёвка сейчас")
+async def admin_draw_now_btn(m: Message):
+    if not is_admin(m):
+        return
+    await m.answer("Стартую жеребьёвку прямо сейчас…")
+    await run_draw_and_notify()
+
+
+@r.message(F.text == "⚙️ Админ: сколько участников")
+async def admin_count_btn(m: Message):
+    if not is_admin(m):
+        return
+    n = await count_participants()
+    await m.answer(f"Участников сейчас: <b>{n}</b>")
+
+
 # -------------------- жеребьёвка --------------------
-def make_derangement(ids: list[int]) -> list[int]:
-    shuffled = ids[:]
-    random.shuffle(shuffled)
-    return shuffled[1:] + shuffled[:1]
+
+def make_derangement(items: list[int]) -> list[int]:
+    """
+    Возвращает дерранжировку элементов `items` (никто не достаётся сам себе).
+    Алгоритм Саттоло: всегда даёт одну циклическую перестановку без фиксированных точек.
+    """
+    if len(items) < 2:
+        raise ValueError("Нужно как минимум 2 участника для жеребьёвки.")
+
+    res = list(items)
+    # Sattolo's algorithm
+    for i in range(len(res) - 1, 0, -1):
+        # j ∈ [0, i-1]
+        j = secrets.randbelow(i)
+        res[i], res[j] = res[j], res[i]
+
+    # Параноидальная проверка (на практике не потребуется)
+    assert all(idx != res[idx] for idx in range(len(res))), "Дерранжировка не удалась"
+    return res
 
 
 async def run_draw_and_notify():
@@ -366,7 +470,6 @@ async def run_draw_and_notify():
         await append_pairs(pairs_to_save)
 
     # --- отправляем дарителям данные получателей + кнопку подтверждения
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
     for i, giver_idx in enumerate(idxs):
         receiver_idx = mapping[i]
         giver = rows[giver_idx]
@@ -382,14 +485,17 @@ async def run_draw_and_notify():
             "Вот кому ты пишешь… только тсс, это тихая магия ✨</b>\n\n"
             f"<b>ФИО:</b> {recv['full_name']}\n"
             f"<b>Индекс:</b> {recv['postal_code']}\n"
-            f"<b>Адрес:</b> {recv['address']}\n\n"
+            f"<b>Адрес:</b> {recv['address']}\n"
+            f"<b>Пожелание:</b> {recv.get('wishes', '—')}\n\n"
             "Как только напишешь получателю, жмякни кнопочку снизу 😳 Я тихонечко шепну, что письмо уже в пути 💌✨"
         )
         try:
             await bot.send_message(int(giver["user_id"]), text, reply_markup=kb.as_markup())
         except Exception as e:
-            logging.exception(f"Ой-ой… сообщение не ушло 😿  {giver['user_id']}: {e}\n"
-                              "Наверное, интернет обиделся… попробуем позже? 🙈 ")
+            logging.exception(
+                f"Ой-ой… сообщение не ушло 😿  {giver['user_id']}: {e}\n"
+                "Наверное, интернет обиделся… попробуем позже? 🙈 "
+            )
 
     if ADMIN_ID:
         await bot.send_message(ADMIN_ID, "Жеребьёвка завершена и участники уведомлены ✅")
@@ -591,16 +697,21 @@ async def echo(m: Message):
 
 
 # -------------------- пары ----------------------
+
 def _read_all_pairs_sync():
-    rows = []
+    rows: list[dict] = []
     if not PAIRS_CSV.exists():
         return rows
     with PAIRS_CSV.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            row["giver_id"] = int(row["giver_id"])
-            row["receiver_id"] = int(row["receiver_id"])
-            row["confirmed"] = row["confirmed"] == "1"
+            if not row:
+                continue
+            # Бережно обрабатываем возможные старые колонки
+            row["giver_id"] = int(row.get("giver_id", 0))
+            row["receiver_id"] = int(row.get("receiver_id", 0))
+            row["confirmed"] = str(row.get("confirmed", "0")) == "1"
+            row.setdefault("confirmed_at", row.get("confirmed_at", ""))
             rows.append(row)
     return rows
 
@@ -610,10 +721,11 @@ async def read_all_pairs():
 
 
 def _append_pairs_sync(items: list[dict]):
-    exists = PAIRS_CSV.exists()
+    # пишем заголовок, если файл новый или пустой
+    need_header = (not PAIRS_CSV.exists()) or (PAIRS_CSV.exists() and PAIRS_CSV.stat().st_size == 0)
     with PAIRS_CSV.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=PAIR_FIELDS)
-        if not exists:
+        if need_header:
             writer.writeheader()
         for it in items:
             writer.writerow(it)
@@ -644,7 +756,7 @@ async def on_sent_confirm(cq: CallbackQuery):
     # callback: sent:<round_id>:<giver_id>
     try:
         payload = (cq.data or "")[len("sent:"):]  # убрали префикс "sent:"
-        round_id, giver_id_str = payload.rsplit(":", 1)  # <-- ключевая правка
+        round_id, giver_id_str = payload.rsplit(":", 1)
         giver_id = int(giver_id_str)
     except Exception:
         await cq.answer("Некорректные данные", show_alert=True)
@@ -679,8 +791,7 @@ async def on_sent_confirm(cq: CallbackQuery):
 
     # перезапишем pairs.csv
     async with file_lock:
-        # простая перезапись всего файла
-        await asyncio.to_thread(lambda rows=pairs: _write_all_pairs_sync(rows))
+        await asyncio.to_thread(_write_all_pairs_sync, pairs)
 
     await cq.answer("Урааа 😭💗 \n"
                     "Ты подтвердил(а), я уже сказала получателю, что письмо в пути!\n"
@@ -695,8 +806,10 @@ async def on_sent_confirm(cq: CallbackQuery):
             "Смотри в ящик, вдруг придёт что-то очень милое 😊"
         )
     except Exception as e:
-        logging.exception(f"Эх… не получилось сказать получателю 😿\n"
-                          "Я правда старалась… можно позже ещё раз? 💌")
+        logging.exception(
+            f"Эх… не получилось сказать получателю 😿: {e}\n"
+            "Я правда старалась… можно позже ещё раз? 💌"
+        )
 
 
 # -------------------- запуск --------------------
