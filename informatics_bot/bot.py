@@ -62,7 +62,11 @@ def main():
     bells = json.loads((BASE / 'bells.json').read_text(encoding='utf-8'))
     if not isinstance(bells, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in bells.items()):
         raise SystemExit('bells.json должен содержать объект с номерами уроков и временем в виде строк.')
-    application = Application.builder().token(token).build()
+    builder = Application.builder().token(token)
+    proxy = os.getenv('TELEGRAM_PROXY_URL', '').strip()
+    if proxy:
+        builder = builder.proxy(proxy).get_updates_proxy(proxy)
+    application = builder.build()
     application.bot_data.update(timezone=timezone, bells=bells)
     application.add_handler(CommandHandler(['start', 'help'], start))
     application.add_handler(MessageHandler(filters.Document.ALL, receive))

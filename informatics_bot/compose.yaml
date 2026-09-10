@@ -1,3 +1,5 @@
+version: "3.7"
+
 services:
   bot:
     build: .
@@ -6,12 +8,7 @@ services:
     env_file:
       - .env
     volumes:
-      - type: bind
-        source: ./bells.json
-        target: /app/bells.json
-        read_only: true
-        bind:
-          create_host_path: false
+      - ./bells.json:/app/bells.json:ro
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
