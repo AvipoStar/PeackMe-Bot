@@ -1,0 +1,26 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    volumes:
+      - type: bind
+        source: ./bells.json
+        target: /app/bells.json
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
